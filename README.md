@@ -68,9 +68,12 @@ The repeated `Server` in Quarm's name is intentional: the TAKP login service
 appends ` Server` to the registered world name. Use the complete server-list name.
 
 The optional fields are `protocol` (default `project1999`), `host`, `port`,
-`assets`, `output`, `health`, `channels`, `include_raw` (default `false`), and
-`reconnect_seconds` (default `30`). `host` and `port` override the selected
-protocol's endpoint. With no `output`, JSONL is written only to standard output.
+`assets`, `output`, `health`, `channels`, `include_raw` (default `false`),
+`reconnect_seconds` (default `30`), and `stream`. `host` and `port` override the
+selected protocol's endpoint. With no `output`, JSONL is written only to
+standard output. Omitting `stream` leaves the process exactly as a JSONL logger:
+nothing listens, and no second file is written.
+
 For P99, omitting `assets` uses the inventory compiled into the binary; set it
 to a readable path to override that inventory. Quarm's implemented handshake
 does not use this inventory. The example supplies the fixed `output` and
@@ -152,6 +155,59 @@ login flow after `reconnect_seconds`, deriving fresh keys for every session.
 SIGTERM closes the active session. Docker's `unless-stopped` policy restarts a
 process that exits. The JSONL file is append-only and needs an external
 retention policy.
+
+## Optional log stream
+
+Set `stream` to also serve new records to external consumers over server-sent events.
+The JSONL file named by `output` is still written first, with the same bytes as
+before. The stream does not read or rewrite that file. It appends a separate
+spool and only starts when this object is present.
+
+```json
+"stream": {
+  "listen": "0.0.0.0:8090",
+  "stream_id": "myguild",
+  "token": "choose-a-long-secret",
+  "spool": "/data/stream.jsonl"
+}
+```
+
+`GET /v1/streams/myguild` with `Authorization: Bearer <token>` returns
+`text/event-stream`. No `Last-Event-ID` follows only records that arrive after
+the connection. A numeric `Last-Event-ID` replays later spool rows, then
+follows. The token is never written to the JSONL dump or logged.
+
+Each `event: line` has an SSE `id` and JSON data containing `seq`, `file`
+(the output basename, or `stdout`), `character`, and the synthesized `line`.
+Malformed or future cursors receive `event: reset` with `seq` and `reason`,
+then follow live. Save the last processed ID and send it on reconnect. A slow
+consumer is disconnected when its 64-record queue fills and can resume from
+the spool. Idle connections receive a comment heartbeat every 15 seconds.
+There are at most 32 connected clients, including requests awaiting authentication.
+Replay reads a fixed file snapshot outside the chat-writer lock with bounded
+memory, then continues with queued live records.
+
+Guild chat is sent as an EQ log line whose clock is the record's UTC receive
+time converted to US Eastern, for example
+`[Fri Mar 06 10:13:03 2026] ExamplePlayer tells the guild, '!tod Lord Nagafen'`. Other
+channels are sent too, but not in that guild form. `decode_error` rows stay in
+the JSONL dump and are left out of the stream.
+
+Publish the listen port yourself when another host must connect. Compose does
+not publish it unless you add that mapping. A read-only container can listen;
+the spool path has to be on the writable data volume, next to `chat.jsonl`.
+Keep the spool as long as you keep the dump. Do not truncate it: sequence
+numbers are not reused.
+
+Use a random, unguessable token (for example 32 random bytes encoded as hex).
+Tokens must be visible ASCII without spaces, at most 1024 bytes. The endpoint
+uses plain HTTP: keep it on a private container network or bind the published
+port to `127.0.0.1`; use a TLS reverse proxy for access across an untrusted network.
+The spool must be a different file from the JSONL output, health file and config,
+including symlink and hard-link aliases. An incomplete final spool row is removed
+on startup; malformed complete rows fail startup. Writes are flushed, not fsynced:
+this is restart replay, not a power-loss durability guarantee. Spool write errors
+are reported through the same failure path as output errors.
 
 EverQuest may temporarily deny a new world entry when the previous session did
 not exit cleanly. The collector treats that response as a connection failure

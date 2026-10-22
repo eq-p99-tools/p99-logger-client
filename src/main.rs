@@ -1,3 +1,5 @@
+mod stream;
+
 use anyhow::{ensure, Context, Result};
 use eq_network::{
     assets::Assets,
@@ -44,6 +46,18 @@ struct Config {
     channels: Option<HashSet<chat::ChannelName>>,
     #[serde(default = "default_reconnect")]
     reconnect_seconds: u64,
+    /// Optional SSE follower. Absent means the process only writes the JSONL dump.
+    #[serde(default)]
+    stream: Option<StreamConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamConfig {
+    listen: String,
+    stream_id: String,
+    token: Zeroizing<String>,
+    spool: PathBuf,
 }
 
 impl Config {
@@ -104,6 +118,7 @@ mod config_tests {
         assert_eq!(config.reconnect_seconds, 30);
         assert_eq!(config.output, None);
         assert_eq!(config.health, None);
+        assert!(config.stream.is_none());
         assert!(!config.include_raw);
         assert_eq!(config.channels, None);
     }
@@ -192,22 +207,79 @@ mod config_tests {
         assert!(config.client_config().logs(&event(4)));
         assert!(!config.client_config().logs(&event(8)));
     }
+
+    #[test]
+    fn jsonl_dump_bytes_stay_the_same_when_streaming() {
+        use eq_network::chat;
+        use eq_network::client::RecordEvent;
+
+        let dir = std::env::temp_dir().join(format!("p99-jsonl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("chat.jsonl");
+        let spool = dir.join("stream.jsonl");
+        let config: Config = serde_json::from_str(&format!(
+            r#"{{
+                "user": "EXAMPLE_LOGIN_ACCOUNT",
+                "pass": "EXAMPLE_PASSWORD",
+                "server": "Project 1999: Green (Velious, PvE)",
+                "character": "ExamplePlayer",
+                "output": "{}",
+                "stream": {{
+                    "listen": "127.0.0.1:0",
+                    "stream_id": "myguild",
+                    "token": "secret",
+                    "spool": "{}"
+                }}
+            }}"#,
+            output.display().to_string().replace('\\', "\\\\"),
+            spool.display().to_string().replace('\\', "\\\\")
+        ))
+        .unwrap();
+        let hub = stream::StreamHub::open(&spool, "chat.jsonl").unwrap();
+        let mut log = ChatLog::new(&config, Some(hub)).unwrap();
+        let mut body = vec![0_u8; 148];
+        body[64..77].copy_from_slice(b"ExamplePlayer");
+        body.extend_from_slice(b"!tod Lord Nagafen\0");
+        let event = chat::parse(0x1004, &body, false).unwrap().unwrap();
+        let record = Record::new(
+            "Green",
+            "ExamplePlayer",
+            "ecommons",
+            "sess",
+            1,
+            RecordEvent::Chat(event),
+        )
+        .with_timestamp("2026-03-06T15:13:03Z");
+        log.emit(&record).unwrap();
+
+        let dumped = fs::read(&output).unwrap();
+        let mut expected = serde_json::to_vec(&record).unwrap();
+        expected.push(b'\n');
+        assert_eq!(dumped, expected);
+        assert!(!String::from_utf8_lossy(&dumped).contains("\"seq\""));
+        assert!(fs::read_to_string(&spool).unwrap().contains("\"seq\":1"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 /// The CLI adapter writes the library's flat records to stdout and an optional file.
+///
+/// `stream` is a separate spool. It is not consulted while the JSONL bytes are produced.
 struct ChatLog {
     file: Option<fs::File>,
+    stream: Option<Arc<stream::StreamHub>>,
 }
 
 impl ChatLog {
-    fn new(config: &Config) -> Result<Self> {
+    fn new(config: &Config, hub: Option<Arc<stream::StreamHub>>) -> Result<Self> {
         let file = config
             .output
             .as_ref()
             .map(|path| fs::OpenOptions::new().create(true).append(true).open(path))
             .transpose()
             .context("open JSONL output")?;
-        Ok(Self { file })
+        Ok(Self { file, stream: hub })
     }
 
     fn emit(&mut self, record: &Record) -> Result<()> {
@@ -217,6 +289,11 @@ impl ChatLog {
             file.write_all(&bytes)?;
         }
         io::stdout().lock().write_all(&bytes)?;
+        if let Some(hub) = &self.stream {
+            if let Some(line) = stream::eq_line(record) {
+                hub.append(&record.character, &line)?;
+            }
+        }
         Ok(())
     }
 }
@@ -366,8 +443,40 @@ fn main() -> Result<()> {
     options.reconnect = zone_duration.is_none() && !world_only;
     options.world_only = world_only;
     options.zone_duration = zone_duration;
-    let mut log = ChatLog::new(&config)?;
-    client.run(
+    let stream_server = match &config.stream {
+        Some(stream_config) => {
+            stream::validate(
+                &stream_config.listen,
+                &stream_config.stream_id,
+                stream_config.token.as_str(),
+                &stream_config.spool,
+            )?;
+            for path in config.output.iter().chain(config.health.iter()) {
+                stream::require_distinct(&stream_config.spool, path)?;
+            }
+            stream::require_distinct(&stream_config.spool, Path::new(&args[1]))?;
+            let file_name = config
+                .output
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .unwrap_or("stdout");
+            let hub = stream::StreamHub::open(&stream_config.spool, file_name)?;
+            let (_addr, handle) = stream::serve(
+                &stream_config.listen,
+                stream_config.stream_id.clone(),
+                stream_config.token.as_str().to_owned(),
+                Arc::clone(&hub),
+            )?;
+            Some((hub, handle))
+        }
+        None => None,
+    };
+    let mut log = ChatLog::new(
+        &config,
+        stream_server.as_ref().map(|(hub, _)| Arc::clone(hub)),
+    )?;
+    let run_result = client.run(
         &CancellationToken::from(stop),
         options,
         |event| match event {
@@ -392,5 +501,9 @@ fn main() -> Result<()> {
             }
             _ => Ok(()),
         },
-    )
+    );
+    if let Some((_, handle)) = stream_server {
+        handle.shutdown();
+    }
+    run_result
 }
